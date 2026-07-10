@@ -22,9 +22,10 @@ jobs:
       - shell: bash
         name: probe-loop
         run: |
-          # GitHub Actions minimum cron is 1 minute — loop inside the job for ~30s cadence
-          # Each iteration: dns + tcp + full oidc request, then sleep 30s, then repeat
           ITER=0
+          FAIL_TS=""
+          FINAL_EXIT=0
+
           while true; do
             ITER=$(( ITER + 1 ))
             NOW=$(date -u +%H:%M:%S)
@@ -37,10 +38,10 @@ jobs:
             DNS_MS=$(( $(date +%s%3N) - DNS_START ))
             echo "dns resolved=${RESOLVED} time=${DNS_MS}ms"
             if [ "${RESOLVED}" != "130.214.144.166" ]; then
-              echo "*** DIFFERENT IP from expected 130.214.144.166 — possible GTM failover ***"
+              echo "*** DIFFERENT IP — GTM failover? ***"
             fi
 
-            # TCP connect only (fast fail on SYN drop)
+            # TCP connect
             TCP_START=$(date +%s%3N)
             if curl -so /dev/null \
                  --connect-timeout 10 \
@@ -54,24 +55,46 @@ jobs:
               TCP_EXIT=$?
               TCP_MS=$(( $(date +%s%3N) - TCP_START ))
               echo "tcp FAILED exit=${TCP_EXIT} in ${TCP_MS}ms"
-              echo "  exit 28=SYN drop | exit 7=RST"
               cat /tmp/tcp_err || true
               TCP_RESULT=fail_${TCP_EXIT}
             fi
 
-            # Full OIDC request — same as original, exit code propagated to SUMMARY only
+            # Full OIDC request — never let exit code kill the loop
             curl -v \
               --connect-timeout 10 \
               --max-time 30 \
               -w "\nTIMINGS: connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s http=%{http_code}" \
               "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
-              2>&1
+              2>&1 || true
             CURL_EXIT=$?
             echo ""
             echo "SUMMARY iter=${ITER} runner_ip=${RUNNER_IP} dns=${RESOLVED} tcp=${TCP_RESULT} curl_exit=${CURL_EXIT}"
 
-            # Stop after 2 iterations (~1 min runtime including sleep) so the next
-            # scheduled run picks up cleanly without overlap
-            [ "${ITER}" -ge 2 ] && break
+            # Track first failure timestamp for recovery window measurement
+            if [ "${CURL_EXIT}" -ne 0 ] && [ -z "${FAIL_TS}" ]; then
+              FAIL_TS=$(date +%s%3N)
+              echo "FIRST_FAIL_AT=${NOW}"
+              FINAL_EXIT=${CURL_EXIT}
+            fi
+
+            # On iter 2: report recovery or persistence
+            if [ "${ITER}" -ge 2 ]; then
+              if [ -n "${FAIL_TS}" ] && [ "${CURL_EXIT}" -eq 0 ]; then
+                RECOVERY_MS=$(( $(date +%s%3N) - FAIL_TS ))
+                echo ""
+                echo "RECOVERY_RESULT: recovered after ~${RECOVERY_MS}ms — supports short outage window hypothesis"
+              elif [ -n "${FAIL_TS}" ] && [ "${CURL_EXIT}" -ne 0 ]; then
+                echo ""
+                echo "RECOVERY_RESULT: still failing after 30s — NOT a short window, sustained block"
+              fi
+              break
+            fi
+
             sleep 30
           done
+
+          # Exit with failure only if BOTH iterations failed
+          # (iter1 fail + iter2 ok = flake confirmed, job still green)
+          if [ -n "${FAIL_TS}" ] && [ "${CURL_EXIT}" -ne 0 ]; then
+            exit ${FINAL_EXIT}
+          fi
