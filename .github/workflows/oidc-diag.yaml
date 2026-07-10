@@ -1,0 +1,68 @@
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  oidc-check:
+    name: OIDC check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_index: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]
+    steps:
+      - shell: bash
+        name: runner-ip
+        run: |
+          RUNNER_IP=$(curl -s https://ifconfig.me)
+          echo "This executor's public IP is: $RUNNER_IP"
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+
+      - shell: bash
+        name: dns-timing
+        run: |
+          echo "=== DNS ==="
+          DNS_START=$(date +%s%3N)
+          RESOLVED=$(dig +short kymagoattest.accounts400.ondemand.com | tail -1)
+          DNS_MS=$(( $(date +%s%3N) - DNS_START ))
+          echo "resolved=${RESOLVED} time=${DNS_MS}ms"
+          if [ "${RESOLVED}" != "130.214.144.166" ]; then
+            echo "DIFFERENT IP from expected 130.214.144.166 — possible GTM failover"
+          fi
+          echo "DNS_RESOLVED=${RESOLVED}" >> "$GITHUB_ENV"
+
+      - shell: bash
+        name: tcp-connect-timing
+        run: |
+          echo "=== TCP connect only (no TLS/HTTP) ==="
+          # --connect-timeout 10 to fail fast if SYN is dropped, not wait 127s
+          TCP_START=$(date +%s%3N)
+          if curl -so /dev/null \
+               --connect-timeout 10 \
+               --max-time 10 \
+               -w "tcp_connect=%{time_connect}s http_code=%{http_code}" \
+               "https://kymagoattest.accounts400.ondemand.com/" 2>/tmp/tcp_err; then
+            echo "TCP OK in $(( $(date +%s%3N) - TCP_START ))ms"
+            TCP_RESULT=ok
+          else
+            EXIT=$?
+            echo "TCP FAILED exit=${EXIT} in $(( $(date +%s%3N) - TCP_START ))ms"
+            # exit 28 = timeout (SYN dropped), exit 7 = refused (RST)
+            echo "  exit 28 = SYN drop (no response) | exit 7 = RST (connection refused)"
+            cat /tmp/tcp_err || true
+            TCP_RESULT=fail_${EXIT}
+          fi
+          echo "TCP_RESULT=${TCP_RESULT}" >> "$GITHUB_ENV"
+
+      - shell: bash
+        name: check-oidc
+        run: |
+          # identical curl as original — captures verbose + timing headers
+          curl -v \
+            -w "\n\nTIMINGS: connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s http=%{http_code}" \
+            "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration"
+          CURL_EXIT=$?
+          echo ""
+          echo "SUMMARY: runner_ip=${RUNNER_IP} dns=${DNS_RESOLVED} tcp=${TCP_RESULT} curl_exit=${CURL_EXIT}"
+          exit $CURL_EXIT
