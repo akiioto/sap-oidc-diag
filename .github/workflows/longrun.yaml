@@ -1,0 +1,84 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  longrun:
+    name: longrun (${{ matrix.runner_index }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_index: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+    steps:
+      - shell: bash
+        name: runner-ip
+        run: |
+          RUNNER_IP=$(curl -s https://ifconfig.me)
+          echo "This executor's public IP is: $RUNNER_IP"
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+
+      - shell: bash
+        name: probe-1h
+        run: |
+          ITER=0
+          FAILS=0
+          END_TS=$(( $(date +%s) + 3600 ))
+
+          while [ $(date +%s) -lt $END_TS ]; do
+            ITER=$(( ITER + 1 ))
+            NOW=$(date -u +%H:%M:%S)
+
+            # DNS — check if IP changed (GTM failover signal)
+            RESOLVED=$(dig +short kymagoattest.accounts400.ondemand.com | tail -1)
+            DNS_TAG=""
+            [ "${RESOLVED}" != "130.214.144.166" ] && DNS_TAG=" *** DIFFERENT IP: ${RESOLVED} ***"
+
+            # Single curl — connect-timeout 4s so loop stays tight at ~5s cadence
+            RESULT=$(curl -sS \
+              --connect-timeout 4 \
+              --max-time 10 \
+              -w "%{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s" \
+              -o /dev/null \
+              "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
+              2>&1)
+            CURL_EXIT=$?
+
+            if [ "${CURL_EXIT}" -ne 0 ]; then
+              FAILS=$(( FAILS + 1 ))
+              echo "FAIL iter=${ITER} at=${NOW} exit=${CURL_EXIT} dns=${RESOLVED}${DNS_TAG} ip=${RUNNER_IP} total_fails=${FAILS}"
+              # immediate retry to measure recovery window
+              sleep 1
+              RETRY=$(curl -sS \
+                --connect-timeout 4 \
+                --max-time 10 \
+                -w "%{http_code} connect=%{time_connect}s" \
+                -o /dev/null \
+                "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
+                2>&1)
+              RETRY_EXIT=$?
+              echo "RETRY iter=${ITER} at=$(date -u +%H:%M:%S) exit=${RETRY_EXIT} result=${RETRY}"
+              if [ "${RETRY_EXIT}" -eq 0 ]; then
+                echo "RECOVERY: recovered after ~1s"
+              else
+                sleep 4
+                RETRY2=$(curl -sS \
+                  --connect-timeout 4 \
+                  --max-time 10 \
+                  -w "%{http_code} connect=%{time_connect}s" \
+                  -o /dev/null \
+                  "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
+                  2>&1)
+                RETRY2_EXIT=$?
+                echo "RETRY2 iter=${ITER} at=$(date -u +%H:%M:%S) exit=${RETRY2_EXIT} result=${RETRY2}"
+                [ "${RETRY2_EXIT}" -eq 0 ] && echo "RECOVERY: recovered after ~5s" || echo "RECOVERY: still down after 5s"
+              fi
+            else
+              echo "ok iter=${ITER} at=${NOW} ${RESULT}${DNS_TAG} ip=${RUNNER_IP}"
+            fi
+
+            sleep 5
+          done
+
+          echo ""
+          echo "DONE runner_index=${{ matrix.runner_index }} ip=${RUNNER_IP} total_iters=${ITER} total_fails=${FAILS}"
