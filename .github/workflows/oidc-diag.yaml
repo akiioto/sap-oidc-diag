@@ -1,6 +1,6 @@
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '* * * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,49 +20,58 @@ jobs:
           echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
 
       - shell: bash
-        name: dns-timing
+        name: probe-loop
         run: |
-          echo "=== DNS ==="
-          DNS_START=$(date +%s%3N)
-          RESOLVED=$(dig +short kymagoattest.accounts400.ondemand.com | tail -1)
-          DNS_MS=$(( $(date +%s%3N) - DNS_START ))
-          echo "resolved=${RESOLVED} time=${DNS_MS}ms"
-          if [ "${RESOLVED}" != "130.214.144.166" ]; then
-            echo "DIFFERENT IP from expected 130.214.144.166 — possible GTM failover"
-          fi
-          echo "DNS_RESOLVED=${RESOLVED}" >> "$GITHUB_ENV"
+          # GitHub Actions minimum cron is 1 minute — loop inside the job for ~30s cadence
+          # Each iteration: dns + tcp + full oidc request, then sleep 30s, then repeat
+          ITER=0
+          while true; do
+            ITER=$(( ITER + 1 ))
+            NOW=$(date -u +%H:%M:%S)
+            echo ""
+            echo "=== iteration ${ITER} at ${NOW} ==="
 
-      - shell: bash
-        name: tcp-connect-timing
-        run: |
-          echo "=== TCP connect only (no TLS/HTTP) ==="
-          # --connect-timeout 10 to fail fast if SYN is dropped, not wait 127s
-          TCP_START=$(date +%s%3N)
-          if curl -so /dev/null \
-               --connect-timeout 10 \
-               --max-time 10 \
-               -w "\ntcp_connect=%{time_connect}s http_code=%{http_code}\n" \
-               "https://kymagoattest.accounts400.ondemand.com/" 2>/tmp/tcp_err; then
-            echo "TCP OK in $(( $(date +%s%3N) - TCP_START ))ms"
-            TCP_RESULT=ok
-          else
-            EXIT=$?
-            echo "TCP FAILED exit=${EXIT} in $(( $(date +%s%3N) - TCP_START ))ms"
-            # exit 28 = timeout (SYN dropped), exit 7 = refused (RST)
-            echo "  exit 28 = SYN drop (no response) | exit 7 = RST (connection refused)"
-            cat /tmp/tcp_err || true
-            TCP_RESULT=fail_${EXIT}
-          fi
-          echo "TCP_RESULT=${TCP_RESULT}" >> "$GITHUB_ENV"
+            # DNS
+            DNS_START=$(date +%s%3N)
+            RESOLVED=$(dig +short kymagoattest.accounts400.ondemand.com | tail -1)
+            DNS_MS=$(( $(date +%s%3N) - DNS_START ))
+            echo "dns resolved=${RESOLVED} time=${DNS_MS}ms"
+            if [ "${RESOLVED}" != "130.214.144.166" ]; then
+              echo "*** DIFFERENT IP from expected 130.214.144.166 — possible GTM failover ***"
+            fi
 
-      - shell: bash
-        name: check-oidc
-        run: |
-          # identical curl as original — captures verbose + timing headers
-          curl -v \
-            -w "\n\nTIMINGS: connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s http=%{http_code}" \
-            "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration"
-          CURL_EXIT=$?
-          echo ""
-          echo "SUMMARY: runner_ip=${RUNNER_IP} dns=${DNS_RESOLVED} tcp=${TCP_RESULT} curl_exit=${CURL_EXIT}"
-          exit $CURL_EXIT
+            # TCP connect only (fast fail on SYN drop)
+            TCP_START=$(date +%s%3N)
+            if curl -so /dev/null \
+                 --connect-timeout 10 \
+                 --max-time 10 \
+                 -w "\ntcp_connect=%{time_connect}s http_code=%{http_code}\n" \
+                 "https://kymagoattest.accounts400.ondemand.com/" 2>/tmp/tcp_err; then
+              TCP_MS=$(( $(date +%s%3N) - TCP_START ))
+              echo "tcp OK in ${TCP_MS}ms"
+              TCP_RESULT=ok
+            else
+              TCP_EXIT=$?
+              TCP_MS=$(( $(date +%s%3N) - TCP_START ))
+              echo "tcp FAILED exit=${TCP_EXIT} in ${TCP_MS}ms"
+              echo "  exit 28=SYN drop | exit 7=RST"
+              cat /tmp/tcp_err || true
+              TCP_RESULT=fail_${TCP_EXIT}
+            fi
+
+            # Full OIDC request — same as original, exit code propagated to SUMMARY only
+            curl -v \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "\nTIMINGS: connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s http=%{http_code}" \
+              "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
+              2>&1
+            CURL_EXIT=$?
+            echo ""
+            echo "SUMMARY iter=${ITER} runner_ip=${RUNNER_IP} dns=${RESOLVED} tcp=${TCP_RESULT} curl_exit=${CURL_EXIT}"
+
+            # Stop after 2 iterations (~1 min runtime including sleep) so the next
+            # scheduled run picks up cleanly without overlap
+            [ "${ITER}" -ge 2 ] && break
+            sleep 30
+          done
