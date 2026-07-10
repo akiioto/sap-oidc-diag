@@ -35,13 +35,14 @@ jobs:
             [ "${RESOLVED}" != "130.214.144.166" ] && DNS_TAG=" *** DIFFERENT IP: ${RESOLVED} ***"
 
             # Single curl — connect-timeout 4s so loop stays tight at ~5s cadence
+            # || true prevents bash -e from killing the script on non-zero exit
             RESULT=$(curl -sS \
               --connect-timeout 4 \
               --max-time 10 \
               -w "%{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s" \
               -o /dev/null \
               "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
-              2>&1)
+              2>&1) || true
             CURL_EXIT=$?
 
             if [ "${CURL_EXIT}" -ne 0 ]; then
@@ -55,7 +56,7 @@ jobs:
                 -w "%{http_code} connect=%{time_connect}s" \
                 -o /dev/null \
                 "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
-                2>&1)
+                2>&1) || true
               RETRY_EXIT=$?
               echo "RETRY iter=${ITER} at=$(date -u +%H:%M:%S) exit=${RETRY_EXIT} result=${RETRY}"
               if [ "${RETRY_EXIT}" -eq 0 ]; then
@@ -68,7 +69,7 @@ jobs:
                   -w "%{http_code} connect=%{time_connect}s" \
                   -o /dev/null \
                   "https://kymagoattest.accounts400.ondemand.com/.well-known/openid-configuration" \
-                  2>&1)
+                  2>&1) || true
                 RETRY2_EXIT=$?
                 echo "RETRY2 iter=${ITER} at=$(date -u +%H:%M:%S) exit=${RETRY2_EXIT} result=${RETRY2}"
                 [ "${RETRY2_EXIT}" -eq 0 ] && echo "RECOVERY: recovered after ~5s" || echo "RECOVERY: still down after 5s"
