@@ -41,7 +41,7 @@ jobs:
           if curl -so /dev/null \
                --connect-timeout 10 \
                --max-time 10 \
-               -w "tcp_connect=%{time_connect}s http_code=%{http_code}" \
+               -w "\ntcp_connect=%{time_connect}s http_code=%{http_code}\n" \
                "https://kymagoattest.accounts400.ondemand.com/" 2>/tmp/tcp_err; then
             echo "TCP OK in $(( $(date +%s%3N) - TCP_START ))ms"
             TCP_RESULT=ok
